@@ -36,7 +36,7 @@
  *   indexing.ts      — indexFiles (parallel Phase 1 read, sequential Phase 2 embed)
  *   index.ts         — extension entry point (this file) + re-exports
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
@@ -44,12 +44,12 @@ import { resolve, extname, basename, relative } from "node:path";
 import ignore from "ignore";
 
 import { RST, B, D, GREEN, CYAN } from "./constants.ts";
-import { getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
+import { setRagDirGetter, getRagDir, GLOBAL_RAG_DIR } from "./store.ts";
 import { loadConfig, saveConfig, normalizeExt, resolveExtensions } from "./config.ts";
-import { openDb, loadIndex, saveIndex, getIndexStats } from "./db.ts";
+import { getDbConn, closeDbConn, getIndexedFiles, getEmbeddedCount, saveIndex, getIndexStats } from "./db.ts";
 import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.ts";
 import { hybridSearch } from "./search.ts";
-import { indexFiles, isIndexStale } from "./indexing.ts";
+import { type ProgressCallbacks, indexFiles, isIndexStale } from "./indexing.ts";
 
 // Re-export the public surface so existing consumers of `pi-local-rag` keep
 // working (tests, downstream code that imports from the package root).
@@ -58,7 +58,7 @@ export { getRagDir, GLOBAL_RAG_DIR, LEGACY_DIR } from "./store.ts";
 export type { RagConfig } from "./config.ts";
 export { loadConfig, saveConfig, defaultConfig, normalizeExt, resolveExtensions } from "./config.ts";
 export type { Chunk, IndexMeta, IndexStats } from "./db.ts";
-export { openDb, getDb, loadIndex, saveIndex, getIndexStats, initSchema, float32ToBuffer } from "./db.ts";
+export { getFreshDbConn, getDbConn, closeDbConn, loadIndex, saveIndex, getIndexStats, initSchema } from "./db.ts";
 export {
   sha256, chunkText, collectFiles, collectFilesAsync, collectFromTracked, collectFromTrackedAsync,
   isExcludedByConfig, extractText, getOcrTooling, isSparsePdfText,
@@ -68,6 +68,7 @@ export type { ScoredChunk } from "./search.ts";
 export { cosineSimilarity, normalize, hybridSearch } from "./search.ts";
 export { isIndexStale, indexFiles } from "./indexing.ts";
 export type { ProgressCallbacks } from "./indexing.ts";
+import * as repo from "./repository.ts";
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
@@ -83,31 +84,28 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const database = openDb();
-    try {
-      const stats = getIndexStats(database);
-      if (stats.totalChunks === 0) return;
+    const indexStats = getIndexStats();
+    if (indexStats.totalChunks === 0) return;
 
-      const indexMeta = { chunks: [], files: {}, lastBuild: stats.lastBuild, embeddingModel: stats.embeddingModel };
-      const now = Date.now();
-      if (isIndexStale(indexMeta) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
-        lastStaleCheckMs = now;
-        // Re-walk tracked paths so new files (and files of newly-supported
-        // extensions, e.g. PDF/DOCX added in a later version) are picked up.
-        // For pre-trackedPaths indexes, fall back to refreshing only known files.
-        const files = config.trackedPaths.length
-          ? collectFromTracked(config)
-          : Object.keys(loadIndex().files).filter(f => existsSync(f));
-        if (files.length) {
-          process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
-          await indexFiles(files, undefined, database);
-          process.stderr.write(`\r\x1b[2K`);
-        }
+    const now = Date.now();
+    if (isIndexStale(indexStats) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
+      lastStaleCheckMs = now;
+      // Re-walk tracked paths so new files (and files of newly-supported
+      // extensions, e.g. PDF/DOCX added in a later version) are picked up.
+      // For pre-trackedPaths indexes, fall back to refreshing only known files.
+      const files = config.trackedPaths.length
+        ? collectFromTracked(config)
+        : getIndexedFiles().map(f => f.path).filter(f => existsSync(f));
+      if (files.length) {
+        process.stderr.write(`\r\x1b[2K[rag] Index stale, refreshing ${files.length} files…`);
+        await indexFiles(files, undefined);
+        process.stderr.write(`\r\x1b[2K`);
       }
+    }
 
-      const results = await hybridSearch(event.prompt, indexMeta, config.ragTopK, config.ragAlpha, database);
-      const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
-      if (!relevant.length) return;
+    const results = await hybridSearch(event.prompt, config.ragTopK, config.ragAlpha);
+    const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
+    if (!relevant.length) return;
 
     const context = relevant.map(r =>
       `### ${basename(r.chunk.file)} (lines ${r.chunk.lineStart}-${r.chunk.lineEnd})\n` +
@@ -131,9 +129,17 @@ export default function (pi: ExtensionAPI) {
           display: false,
         },
       };
-    } finally {
-      database.close();
-    }
+  });
+
+  pi.registerFlag("rag-dir", {
+    description: "Directory to store the RAG index database",
+    type: "string",
+  });
+
+  setRagDirGetter(() => pi.getFlag("rag-dir") as string | undefined);
+
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    closeDbConn();
   });
 
   // ── /rag command ──
@@ -151,6 +157,49 @@ export default function (pi: ExtensionAPI) {
     { value: "off",      label: "off",      description: "Disable auto-injection" },
     { value: "help",     label: "help",     description: "Show all /rag commands" },
   ];
+
+  // ── Progress callback factory ──
+  function makeProgressCallbacks(
+    ctx: ExtensionCommandContext,
+    label: string,
+    doneLabel: string,
+    includeEmbed = false
+  ): ProgressCallbacks {
+    const progressBar = (n: number, total: number, width = 24): string => {
+      const filled = Math.round((n / total) * width);
+      return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
+    };
+
+    return {
+      onFile(current, total, filename, skipped) {
+        const pct = Math.round((current / total) * 100);
+        const bar = progressBar(current, total);
+        ctx.ui.setStatus("rag", `■ ${label} ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
+        ctx.ui.setWidget("rag", [
+          `${B}${CYAN}${label}${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+          `${D}file:    ${RST}${filename}`,
+          `${D}done:    ${RST}${GREEN}${current - skipped} ${doneLabel}${RST}  ${D}${skipped} unchanged${RST}`,
+        ]);
+      },
+      onChunk(ci, total, filename) {
+        ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
+      },
+      onSave() {
+        ctx.ui.setStatus("rag", `■ Saving index...`);
+      },
+      ...(includeEmbed && {
+        onEmbed(done, total) {
+          const pct = Math.round((done / total) * 100);
+          const bar = progressBar(done, total);
+          ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+          ctx.ui.setWidget("rag", [
+            `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+            `${D}chunks:  ${RST}${done}/${total}`,
+          ]);
+        },
+      }),
+    };
+  }
 
   pi.registerCommand("rag", {
     description: "pi-local-rag: /rag index|search|find|status|rebuild [--force]|refresh|clear|exclude|on|off|ext",
@@ -182,30 +231,7 @@ export default function (pi: ExtensionAPI) {
         const total = files.length;
         ctx.ui.notify(`Found ${total} files to index`, "info");
 
-        function progressBar(n: number, total: number, width = 24): string {
-          const filled = Math.round((n / total) * width);
-          return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
-        }
-
-        const result = await indexFiles(files, {
-          onFile(current, total, filename, skipped) {
-            const pct = Math.round((current / total) * 100);
-            const bar = progressBar(current, total);
-            ctx.ui.setStatus("rag", `■ Indexing ${pct}% │ ${current}/${total} files │ ${skipped} unchanged`);
-            ctx.ui.setWidget("rag", [
-              `${B}${CYAN}Indexing${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-              `${D}file:    ${RST}${filename}`,
-              `${D}done:    ${RST}${GREEN}${current - skipped} embedded${RST}  ${D}${skipped} unchanged${RST}`,
-            ]);
-          },
-          onChunk(ci, total, filename) {
-            ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
-          },
-          onSave() {
-            ctx.ui.setStatus("rag", `■ Saving index...`);
-          },
-        });
-
+        const result = await indexFiles(files, makeProgressCallbacks(ctx, "Indexing", "embedded"));
         ctx.ui.setStatus("rag", undefined);
         ctx.ui.setWidget("rag", undefined);
 
@@ -220,15 +246,12 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "search") {
         const query = parts.slice(1).join(" ");
         if (!query) { ctx.ui.notify("Usage: /rag search <query>", "warning"); return; }
-        const index = loadIndex();
         const config = loadConfig();
-        const results = await hybridSearch(query, index, 10, config.ragAlpha);
+        const results = await hybridSearch(query, 10, config.ragAlpha);
         if (!results.length) { ctx.ui.notify(`No results for: ${query}`, "warning"); return; }
 
         const th = ctx.ui.theme;
-        const database = openDb();
-        const hasVectors = getIndexStats(database).embeddedCount > 0;
-        database.close();
+        const hasVectors = getEmbeddedCount() > 0;
         const lines: string[] = [
           th.bold(th.fg("accent", "🔍 ") + `${results.length} results for "${query}"`) +
             "  " + th.fg("dim", hasVectors ? "hybrid BM25+vector" : "BM25 only"),
@@ -263,111 +286,74 @@ export default function (pi: ExtensionAPI) {
         const rebuildArgs = parts.slice(1);
         const force = rebuildArgs.includes("--force");
 
-        const database = openDb();
+        const database = getDbConn();
         const config = loadConfig();
-        try {
-          const indexedRows = database.prepare("SELECT path FROM files").all() as Array<{ path: string }>;
-          const indexedFileSet = new Set(indexedRows.map(f => f.path));
+        const indexedFileSet = new Set(repo.listFilePaths(database));
 
-          // Walking tracked paths can stall the event loop on large trees
-          // (45k+ files). Use the async variant + yield up-front so the user
-          // gets immediate feedback before the heavy work begins.
-          ctx.ui.notify("Scanning tracked paths...", "info");
-          const trackedFiles = await collectFromTrackedAsync(config);
+        // Walking tracked paths can stall the event loop on large trees
+        // (45k+ files). Use the async variant + yield up-front so the user
+        // gets immediate feedback before the heavy work begins.
+        ctx.ui.notify("Scanning tracked paths...", "info");
+        const trackedFiles = await collectFromTrackedAsync(config);
 
-          // Union of currently-indexed files and files discovered by walking tracked paths.
-          const targetSet = new Set<string>([...trackedFiles]);
-          for (const f of indexedFileSet) {
-            if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
-              targetSet.add(f);
-            }
+        // Union of currently-indexed files and files discovered by walking tracked paths.
+        const targetSet = new Set<string>([...trackedFiles]);
+        for (const f of indexedFileSet) {
+          if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
+            targetSet.add(f);
           }
-          const targetFiles = [...targetSet];
-
-          if (!targetFiles.length && !indexedFileSet.size) {
-            ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
-            return;
-          }
-
-          // Files in the index but no longer present (deleted, excluded, or untracked).
-          const droppedFiles = [...indexedFileSet].filter(f => !targetSet.has(f));
-          for (const f of droppedFiles) {
-            database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)").run(f);
-            database.prepare("DELETE FROM chunks WHERE file_path = ?").run(f);
-            database.prepare("DELETE FROM files WHERE path = ?").run(f);
-          }
-          if (force) {
-            // --force: wipe everything and rebuild the FTS index. indexFiles
-            // will then insert fresh rows for every targetFile, bypassing the
-            // skip-on-equal-hash check.
-            database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
-            database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
-          } else {
-            for (const f of targetFiles) {
-              database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
-            }
-          }
-
-          const newFiles = targetFiles.filter(f => !indexedFileSet.has(f));
-          ctx.ui.notify(`Rebuilding ${targetFiles.length} files${force ? " (forced)" : ""}...`, "info");
-          if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
-          if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
-
-          // Yield so the TUI can paint the "Rebuilding" message before
-          // indexFiles starts hammering the event loop.
-          await new Promise<void>(r => setTimeout(r, 0));
-
-          function progressBar(n: number, total: number, width = 24): string {
-            const filled = Math.round((n / total) * width);
-            return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
-          }
-
-          const result = await indexFiles(targetFiles, {
-            onFile(current, total, filename, skipped) {
-              const pct = Math.round((current / total) * 100);
-              const bar = progressBar(current, total);
-              ctx.ui.setStatus("rag", `■ Rebuilding ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
-              ctx.ui.setWidget("rag", [
-                `${B}${CYAN}Rebuilding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-                `${D}file:    ${RST}${filename}`,
-                `${D}done:    ${RST}${GREEN}${current - skipped} re-embedded${RST}  ${D}${skipped} unchanged${RST}`,
-              ]);
-            },
-            onEmbed(done, total) {
-              const pct = Math.round((done / total) * 100);
-              const bar = progressBar(done, total);
-              ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
-              ctx.ui.setWidget("rag", [
-                `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-                `${D}chunks:  ${RST}${done}/${total}`,
-              ]);
-            },
-            onChunk(ci, total, filename) {
-              ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
-            },
-            onSave() {
-              ctx.ui.setStatus("rag", `■ Saving index...`);
-            },
-          }, database, force);
-
-          ctx.ui.setStatus("rag", undefined);
-          ctx.ui.setWidget("rag", undefined);
-
-          const secs = (result.durationMs / 1000).toFixed(1);
-          ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${droppedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
-        } finally {
-          database.close();
         }
+        const targetFiles = [...targetSet];
+
+        if (!targetFiles.length && !indexedFileSet.size) {
+          ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
+          return;
+        }
+
+        // Files in the index but no longer present (deleted, excluded, or untracked).
+        const droppedFiles = [...indexedFileSet].filter(f => !targetSet.has(f));
+        for (const f of droppedFiles) {
+          repo.deleteVectorsForFile(database, f);
+          repo.deleteChunksForFile(database, f);
+          repo.deleteFile(database, f);
+        }
+        if (force) {
+          // --force: wipe everything and rebuild the FTS index. indexFiles
+          // will then insert fresh rows for every targetFile, bypassing the
+          // skip-on-equal-hash check.
+          repo.clearAllVectors(database);
+        } else {
+          for (const f of targetFiles) {
+            repo.setFileEmbedded(database, f, false);
+          }
+        }
+
+        const newFiles = targetFiles.filter(f => !indexedFileSet.has(f));
+        ctx.ui.notify(`Rebuilding ${targetFiles.length} files${force ? " (forced)" : ""}...`, "info");
+        if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
+        if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
+
+        // Yield so the TUI can paint the "Rebuilding" message before
+        // indexFiles starts hammering the event loop.
+        await new Promise<void>(r => setTimeout(r, 0));
+
+        const result = await indexFiles(targetFiles, makeProgressCallbacks(ctx, "Rebuilding", "re-embedded", true), database, force);
+        ctx.ui.setStatus("rag", undefined);
+        ctx.ui.setWidget("rag", undefined);
+
+        const secs = (result.durationMs / 1000).toFixed(1);
+        ctx.ui.notify(`✅ Rebuilt: ${result.indexed} re-indexed · ${result.skipped} unchanged · ${droppedFiles.length} deleted · ${result.chunks} chunks · ${secs}s`, "info");
+
         return;
       }
 
       // ── refresh (on-demand equivalent of the 24h auto-refresh) ──
       if (cmd === "refresh") {
         const config = loadConfig();
-        const index = loadIndex();
+        const filesFromDb = getIndexedFiles();
         const files = config.trackedPaths.length
           ? collectFromTracked(config)
-          : Object.keys(index.files).filter(f => existsSync(f));
+          : filesFromDb.map(f => f.path).filter(f => existsSync(f));
         if (!files.length) {
           ctx.ui.notify("No tracked files to refresh. Run /rag index <path> first.", "warning");
           return;
@@ -375,30 +361,7 @@ export default function (pi: ExtensionAPI) {
 
         ctx.ui.notify(`Refreshing ${files.length} files...`, "info");
 
-        function progressBar(n: number, total: number, width = 24): string {
-          const filled = Math.round((n / total) * width);
-          return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
-        }
-
-        const result = await indexFiles(files, {
-          onFile(current, total, filename, skipped) {
-            const pct = Math.round((current / total) * 100);
-            const bar = progressBar(current, total);
-            ctx.ui.setStatus("rag", `■ Refreshing ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
-            ctx.ui.setWidget("rag", [
-              `${B}${CYAN}Refreshing${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
-              `${D}file:    ${RST}${filename}`,
-              `${D}done:    ${RST}${GREEN}${current - skipped} new/changed${RST}  ${D}${skipped} unchanged${RST}`,
-            ]);
-          },
-          onChunk(ci, total, filename) {
-            ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
-          },
-          onSave() {
-            ctx.ui.setStatus("rag", `■ Saving index...`);
-          },
-        });
-
+        const result = await indexFiles(files, makeProgressCallbacks(ctx, "Refreshing", "new/changed"));
         ctx.ui.setStatus("rag", undefined);
         ctx.ui.setWidget("rag", undefined);
 
@@ -519,12 +482,12 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const index = loadIndex();
+        const files = getIndexedFiles();
         const cwd = process.cwd();
         const ig = ignore().add([glob]);
 
         const matches: string[] = [];
-        for (const fp of Object.keys(index.files)) {
+        for (const fp of files.map(f => f.path)) {
           const rel = relative(cwd, fp);
           const candidate = rel && !rel.startsWith("..") ? rel : basename(fp);
           if (ig.ignores(candidate)) matches.push(fp);
@@ -573,15 +536,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── status (default) ──
-      const index = loadIndex();
+      const indexStats = getIndexStats();
       const config = loadConfig();
-      const database = openDb();
-      const stats = getIndexStats(database);
-      database.close();
-      const fileCount = stats.totalFiles;
-      const totalTokens = stats.totalTokens;
-      const embeddedCount = stats.embeddedCount;
-      const vectorCoverage = stats.totalChunks ? Math.round(embeddedCount / stats.totalChunks * 100) : 0;
+      const fileCount = indexStats.totalFiles;
+      const totalTokens = indexStats.totalTokens;
+      const embeddedCount = indexStats.embeddedCount;
+      const vectorCoverage = indexStats.totalChunks ? Math.round(embeddedCount / indexStats.totalChunks * 100) : 0;
 
       const th = ctx.ui.theme;
       const label = (k: string) => th.fg("dim", k.padEnd(18));
@@ -592,11 +552,11 @@ export default function (pi: ExtensionAPI) {
         th.bold("🔍 pi-local-rag"),
         "",
         "  " + label("Files indexed:")  + val(fileCount),
-        "  " + label("Chunks:")         + val(stats.totalChunks),
+        "  " + label("Chunks:")         + val(indexStats.totalChunks),
         "  " + label("Vectors:")        + val(embeddedCount) + "  " + th.fg("dim", `(${vectorCoverage}% coverage)`),
         "  " + label("Total tokens:")   + val(totalTokens.toLocaleString()),
-        "  " + label("Embedding model:") + th.fg("dim", stats.embeddingModel || "none"),
-        "  " + label("Last build:")     + (stats.lastBuild || th.fg("dim", "never")),
+        "  " + label("Embedding model:") + th.fg("dim", indexStats.embeddingModel || "none"),
+        "  " + label("Last build:")     + (indexStats.lastBuild || th.fg("dim", "never")),
         "  " + label("Storage:")        + th.fg("dim", `${ragDir} (${scope})`),
         "",
         "  " + label("RAG injection:")  +
@@ -606,8 +566,9 @@ export default function (pi: ExtensionAPI) {
 
       if (fileCount) {
         lines.push("", "  " + th.bold("File types:"));
+        const files = getIndexedFiles();
         const byExt: Record<string, number> = {};
-        for (const f of Object.keys(index.files)) byExt[extname(f)] = (byExt[extname(f)] || 0) + 1;
+        for (const f of files.map(f => f.path)) byExt[extname(f)] = (byExt[extname(f)] || 0) + 1;
         for (const [ext, count] of Object.entries(byExt).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
           lines.push("    " + th.fg("muted", ext) + "  " + th.fg("dim", String(count)));
         }
@@ -667,10 +628,9 @@ export default function (pi: ExtensionAPI) {
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
     }),
     execute: async (_toolCallId, params) => {
-      const index = loadIndex();
-      if (!index.chunks.length) return { content: [{ type: "text" as const, text: "pi-local-rag index is empty. Run rag_index first." }], details: undefined };
+      if (getIndexStats().totalChunks === 0) return { content: [{ type: "text" as const, text: "pi-local-rag index is empty. Run rag_index first." }], details: undefined };
       const config = loadConfig();
-      const results = await hybridSearch(params.query, index, params.limit ?? 10, config.ragAlpha);
+      const results = await hybridSearch(params.query, params.limit ?? 10, config.ragAlpha);
       if (!results.length) return { content: [{ type: "text" as const, text: `No results for: ${params.query}` }], details: undefined };
       const text = JSON.stringify(results.map(r => ({
         file: r.chunk.file,
@@ -689,16 +649,13 @@ export default function (pi: ExtensionAPI) {
     description: "Show pi-local-rag index statistics: file count, chunk count, vector coverage, embedding model, RAG config.",
     parameters: Type.Object({}),
     execute: async (_toolCallId) => {
+      const stats = getIndexStats();
       const config = loadConfig();
-      const database = openDb();
-      const stats = getIndexStats(database);
-      database.close();
-      const embeddedCount = stats.embeddedCount;
       const text = JSON.stringify({
         files: stats.totalFiles,
         chunks: stats.totalChunks,
-        vectorsEmbedded: embeddedCount,
-        vectorCoverage: stats.totalChunks ? `${Math.round(embeddedCount / stats.totalChunks * 100)}%` : "0%",
+        vectorsEmbedded: stats.embeddedCount,
+        vectorCoverage: stats.totalChunks ? `${Math.round(stats.embeddedCount / stats.totalChunks * 100)}%` : "0%",
         embeddingModel: stats.embeddingModel || "none",
         totalTokens: stats.totalTokens,
         lastBuild: stats.lastBuild || "never",
