@@ -55,6 +55,49 @@ The OCR fallback is silent when these tools aren't installed (logs one stderr hi
 
 Tab-completion is available for every subcommand.
 
+### Standalone CLI
+
+Every `/rag` subcommand is also runnable from the shell via the bundled
+`pi-local-rag` binary — with no `pi` session, no TUI, and no auto-injection.
+It reuses the exact same command handlers, so behavior is identical.
+
+```bash
+pi-local-rag status
+pi-local-rag index ./src
+pi-local-rag search "hybrid bm25"
+pi-local-rag reindex --force        # alias for `rebuild --force`
+pi-local-rag refresh
+pi-local-rag find "*.ts"
+pi-local-rag clear
+pi-local-rag exclude dist
+pi-local-rag ext list
+pi-local-rag on            # edits config.json (matters for the extension's auto-inject)
+pi-local-rag help
+```
+
+Global flags (may appear before or after the subcommand):
+
+| Flag | Description |
+|---|---|
+| `--rag-dir <path>` / `--rag-dir=<path>` | Override the RAG store directory (also `$PI_RAG_DIR`) |
+| `--no-color` | Disable ANSI colors (also `NO_COLOR=1`) |
+| `--help`, `-h` | Show help |
+| `--version`, `-V` | Print version and exit |
+
+Store resolution is identical to the extension: `--rag-dir` flag → `$PI_RAG_DIR`
+→ walk-up `.pi/rag/` → `${cwd}/.pi/rag/` (on first `index`) → `~/.pi/rag/`.
+
+Exit codes: `0` success · `1` runtime error or handler-reported error ·
+`2` bad usage. Progress bars go to **stderr** so piped **stdout** stays clean:
+
+```bash
+pi-local-rag search "foo" | jq .   # stdout = result panel only
+```
+
+Build the CLI artifact with `npm run build:cli` (bundles `cli.ts` →
+`dist/cli.js` via esbuild; native deps are externalized). `prepublishOnly`
+rebuilds it automatically.
+
 ## Example session
 
 ```text

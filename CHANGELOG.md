@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- **Standalone CLI** (`pi-local-rag` binary): every `/rag` subcommand is now runnable from the shell with no `pi` session, TUI, or auto-injection. Reuses the exact command handlers via a minimal `ctx.ui` shim (`notify`→stdout/stderr, `setStatus`/progress→stderr, `setWidget` result panel→stdout). Examples: `pi-local-rag status`, `pi-local-rag index ./src`, `pi-local-rag search "q"`, `pi-local-rag reindex --force` (alias for `rebuild`), `pi-local-rag refresh`, `pi-local-rag find "*.ts"`, `pi-local-rag clear`, `pi-local-rag exclude dist`, `pi-local-rag ext list`, `pi-local-rag on|off`, `pi-local-rag help`.
+- **Global flags**: `--rag-dir <path>` / `--rag-dir=<path>` (override store; also `$PI_RAG_DIR`), `--no-color` (also `NO_COLOR=1`), `--help`/`-h`, `--version`/`-V`.
+- **Exit codes**: `0` success · `1` runtime error or handler-reported error · `2` bad usage. Progress bars go to stderr so piped stdout stays clean.
+- **Build**: `npm run build:cli` bundles `cli.ts` → `dist/cli.js` via esbuild (native deps externalized); `prepublishOnly` rebuilds it.
+- **New files**: `cli.ts`, `cli/theme.ts`, `cli/context.ts`, `cli/args.ts`, `__tests__/cli.test.ts`.
+
 ## 0.4.1
 
 - **Docs refresh**: README rewritten for 0.4.0 feature set — SQLite/FTS5/sqlite-vec storage, PDF/DOCX/HTML extraction, OCR fallback, per-project store, tracked paths + exclude patterns, 24 h auto-refresh, trailing-message auto-injection. Commands table expanded with `/rag find`, `/rag refresh`, `/rag rebuild --force`, `/rag exclude`, `/rag help`. Optional OCR install instructions (`brew install poppler tesseract tesseract-lang` / `apt install poppler-utils tesseract-ocr ...`). New "Testing" section noting `SKIP_EMBEDDING_TESTS` and the tesseract-absent OCR skip.
