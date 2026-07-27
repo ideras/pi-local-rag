@@ -3,7 +3,7 @@
 export const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
 export const GREEN = "\x1b[32m", YELLOW = "\x1b[33m", CYAN = "\x1b[36m", RED = "\x1b[31m", MAGENTA = "\x1b[35m";
 
-export const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+export const EMBEDDING_MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
 export const VECTOR_DIM = 384;
 
 export const DEFAULT_TEXT_EXTS = [

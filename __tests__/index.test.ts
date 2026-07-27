@@ -153,14 +153,33 @@ describe("chunkText", () => {
     expect(chunkText("tiny").length).toBe(0);
   });
 
-  it("respects maxLines and produces consecutive line ranges", () => {
+  it("respects maxLines and produces contiguous (non-gapped) line ranges", () => {
     const lines = Array.from({ length: 120 }, (_, i) => `line ${i + 1} content`);
     const chunks = chunkText(lines.join("\n"), 50);
     expect(chunks.length).toBeGreaterThanOrEqual(2);
     expect(chunks[0].lineStart).toBe(1);
     for (let i = 1; i < chunks.length; i++) {
-      expect(chunks[i].lineStart, "consecutive chunks should be contiguous")
-        .toBe(chunks[i - 1].lineEnd + 1);
+      // Chunks may now overlap (see next test) but must never leave a gap —
+      // every line has to be covered by at least one chunk.
+      expect(chunks[i].lineStart, "no chunk should skip lines").toBeLessThanOrEqual(chunks[i - 1].lineEnd + 1);
+    }
+  });
+
+  it("overlaps consecutive chunks by overlapLines so boundary content appears in both", () => {
+    const lines = Array.from({ length: 120 }, (_, i) => `line ${i + 1} content`);
+    const chunks = chunkText(lines.join("\n"), 50, 8);
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < chunks.length; i++) {
+      const overlap = chunks[i - 1].lineEnd - chunks[i].lineStart + 1;
+      expect(overlap, `chunk ${i} should overlap the previous chunk by ~8 lines`).toBe(8);
+    }
+  });
+
+  it("overlapLines=0 preserves the old exactly-contiguous behavior", () => {
+    const lines = Array.from({ length: 120 }, (_, i) => `line ${i + 1} content`);
+    const chunks = chunkText(lines.join("\n"), 50, 0);
+    for (let i = 1; i < chunks.length; i++) {
+      expect(chunks[i].lineStart).toBe(chunks[i - 1].lineEnd + 1);
     }
   });
 
@@ -819,6 +838,29 @@ describe("hybridSearch (BM25 via FTS5, no vectors)", () => {
     }
   });
 
+  it("falls back to OR when the strict AND query matches nothing (partial term overlap)", async () => {
+    const db = createTestDb([
+      { content: "process payment amount through payment gateway charge" },
+      { content: "refund order through payment gateway refund" },
+    ]);
+    // "xyz" doesn't appear anywhere, so a strict AND ("payment" AND "xyz")
+    // would return zero BM25 hits even though "payment" is a strong match on
+    // its own — this is exactly the recall gap the OR fallback closes.
+    const results = await hybridSearch("payment xyz", 10, 1.0, db);
+    db.close();
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.some(r => r.chunk.content.includes("payment"))).toBe(true);
+  });
+
+  it("single-term query is unaffected by the AND/OR fallback logic", async () => {
+    const db = createTestDb([
+      { content: "function authenticate(user, password) { return checkCredentials(user, password); }" },
+    ]);
+    const results = await hybridSearch("authenticate", 10, 1.0, db);
+    db.close();
+    expect(results.length).toBe(1);
+  });
+
   it("filename boost: first query term matching filename scores higher", async () => {
     const db = createTestDb([
       { file: "/src/auth module", content: "export function login for user verification" },
@@ -827,6 +869,78 @@ describe("hybridSearch (BM25 via FTS5, no vectors)", () => {
     const results = await hybridSearch("auth user", 10, 1.0, db);
     db.close();
     expect(results[0]?.chunk.file).toContain("auth");
+  });
+
+  // Regression: FTS5 bm25() is *negative* and "more negative = better",
+  // while our internal convention is "higher normalized score = better".
+  // The min-max normalization must therefore peak at the most-negative bm25
+  // (the best match), not at the max. Before the fix this was inverted:
+  // the worst lexical match normalized to 1.0 and the best to 0.0, which
+  // surfaced in real usage as an unrelated chunk ranking #1 at ~0.8 for a
+  // query whose exact term appeared verbatim elsewhere.
+  it("bm25 normalization ranks the best lexical match first, not last", async () => {
+    // Three chunks that all match "residente" but with clearly different
+    // lexical strength (FTS5 bm25 = most-negative-is-best).
+    const db = createTestDb([
+      // A: dense + prominent — best lexical match (most-negative bm25)
+      { content: "Registro de Nuevo Residente\nEl residente debe presentar documentos y completar el formulario de ingreso." },
+      // B: "residente" once, inside a medium-length tangential chunk
+      { content: "Control de Salidas. Salida de Mobiliario o Menaje. Requisitos. Procedimiento. El residente debe tener los pagos al dia antes de retirar cualquier bien del inmueble." },
+      // C: "residente" once, buried at the end of a long tangential chunk
+      { content: "Procedimiento administrativo largo con muchos terminos irrelevantes y reglas internas del departamento contable donde se menciona en una nota al pie que el residente figura en el listado nominal una sola vez al final del documento extenso." },
+    ]);
+    const results = await hybridSearch("residente", 10, 1.0, db);
+    db.close();
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    // The best lexical match must normalize to 1.0 and rank first. Before the
+    // fix the normalization peaked at the *max* (least-negative = worst) bm25
+    // score, so this dense chunk normalized to 0 and was dropped entirely.
+    expect(results[0].bm25).toBe(1);
+    expect(results[0].chunk.content).toContain("Registro de Nuevo Residente");
+    // The long tangential chunk must never outrank the dense one.
+    const tangential = results.find(r => r.chunk.content.startsWith("Procedimiento administrativo"));
+    if (tangential) expect(tangential.bm25).toBeLessThan(results[0].bm25);
+  });
+
+  // Regression: the exit filter. min-max normalization floors the weakest
+  // genuine match at exactly 0, so a `hybrid > 0` filter used to drop it. The
+  // retention gate now keeps any chunk retrieved by a contributing path, so the
+  // weaker of two lexical hits is returned (sorted last) instead of vanishing.
+  it("retains the weaker of two genuine BM25 matches (no vectors)", async () => {
+    const db = createTestDb([
+      // Both chunks match "residente"; the second is the weaker (term once,
+      // buried in a longer block), so it normalizes to 0 and was dropped by
+      // the old `hybrid > 0` exit filter.
+      { content: "Registro de Nuevo Residente. El residente debe presentar documentos y completar el formulario de ingreso." },
+      { content: "Control de Salidas. Salida de Mobiliario o Menaje. Requisitos. Procedimiento. El residente debe tener los pagos al dia antes de retirar cualquier bien." },
+    ]);
+    const results = await hybridSearch("residente", 10, 1.0, db);
+    db.close();
+    // Both genuine lexical matches must be returned — the weakest sorts last
+    // but is no longer discarded.
+    expect(results.length).toBe(2);
+    expect(results[0].bm25).toBeGreaterThan(results[1].bm25);
+    expect(results[1].hybrid).toBe(0);
+  });
+
+  // Counterpart to the above: vector-only neighbors that contribute nothing
+  // under a pure-BM25 (alpha = 1) query are still suppressed, because the
+  // vector weight is 0. This is the noise the old exit filter was guarding,
+  // and the retention gate replaces that guard without losing genuine matches.
+  it("suppresses vector-only neighbors under a pure-BM25 query (alpha = 1)", async () => {
+    const vec = (seed: number) => Array.from({ length: 384 }, (_, i) => (i === seed ? 1 : 0));
+    const db = createTestDb([
+      // No lexical overlap with "residente" at all; only vector retrieval can
+      // surface these, and under alpha = 1 that path contributes 0 to hybrid.
+      { content: "function render the homepage template with context data", vector: vec(1) },
+      { content: "compute the invoice total for the billing period", vector: vec(2) },
+    ]);
+    const results = await hybridSearch("residente", 10, 1.0, db);
+    db.close();
+    const nonZero = results.filter(r => r.hybrid > 0);
+    expect(nonZero.length).toBe(0);
+    // And the retention gate drops them entirely: no zero-fill noise returned.
+    expect(results.length).toBe(0);
   });
 });
 
