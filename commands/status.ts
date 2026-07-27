@@ -2,6 +2,7 @@ import { extname } from "node:path";
 import { loadConfig } from "../config.ts";
 import { getIndexedFiles, getIndexStats } from "../db.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "../store.ts";
+import { EMBEDDING_MODEL } from "../constants.ts";
 import type { RagCommandHandler } from "./types.ts";
 import { setInfoWidget } from "./widget.ts";
 
@@ -12,12 +13,17 @@ export const statusCommand: RagCommandHandler = ({ ctx }) => {
   const totalTokens = indexStats.totalTokens;
   const embeddedCount = indexStats.embeddedCount;
   const vectorCoverage = indexStats.totalChunks ? Math.round(embeddedCount / indexStats.totalChunks * 100) : 0;
+  const embeddingModelMismatch = !!indexStats.embeddingModel && indexStats.embeddingModel !== EMBEDDING_MODEL;
 
   const th = ctx.ui.theme;
   const label = (k: string) => th.fg("dim", k.padEnd(18));
   const val = (v: string | number) => th.fg("success", String(v));
   const ragDir = getRagDir();
   const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
+  let embeddingModelLabel = th.fg("dim", indexStats.embeddingModel || "none");
+  if (embeddingModelMismatch) {
+    embeddingModelLabel += "  " + th.fg("warning", `(⚠ Model Mismatch: Actual: ${EMBEDDING_MODEL})`);
+  }
   const lines: string[] = [
     th.bold("🔍 pi-local-rag"),
     "",
@@ -25,7 +31,7 @@ export const statusCommand: RagCommandHandler = ({ ctx }) => {
     "  " + label("Chunks:")         + val(indexStats.totalChunks),
     "  " + label("Vectors:")        + val(embeddedCount) + "  " + th.fg("dim", `(${vectorCoverage}% coverage)`),
     "  " + label("Total tokens:")   + val(totalTokens.toLocaleString()),
-    "  " + label("Embedding model:") + th.fg("dim", indexStats.embeddingModel || "none"),
+    "  " + label("Embedding model:") + embeddingModelLabel,
     "  " + label("Last build:")     + (indexStats.lastBuild || th.fg("dim", "never")),
     "  " + label("Storage:")        + th.fg("dim", `${ragDir} (${scope})`),
     "",
@@ -33,6 +39,16 @@ export const statusCommand: RagCommandHandler = ({ ctx }) => {
       (config.ragEnabled ? th.fg("success", "enabled") : th.fg("warning", "disabled")) +
       th.fg("dim", `  topK=${config.ragTopK}  threshold=${config.ragScoreThreshold}  alpha=${config.ragAlpha}`),
   ];
+
+  if (embeddingModelMismatch) {
+    lines.push(
+      "",
+      "  " + th.fg("warning", "⚠ Indexed vectors were built with a different embedding model.") ,
+      "  " + th.fg("dim", `    indexed: ${indexStats.embeddingModel}`),
+      "  " + th.fg("dim", `    configured: ${EMBEDDING_MODEL}`),
+      "  " + th.fg("dim", "    Vector search is comparing embeddings from two different models — run /rag rebuild --force."),
+    );
+  }
 
   if (fileCount) {
     lines.push("", "  " + th.bold("File types:"));

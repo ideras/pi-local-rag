@@ -15,7 +15,11 @@ export function sha256(data: string): string {
   return createHash("sha256").update(data).digest("hex").slice(0, 12);
 }
 
-export function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
+export function chunkText(
+  text: string,
+  maxLines = 50,
+  overlapLines = 8,
+): { content: string; lineStart: number; lineEnd: number }[] {
   const lines = text.split("\n");
   const chunks: { content: string; lineStart: number; lineEnd: number }[] = [];
   let i = 0;
@@ -28,7 +32,14 @@ export function chunkText(text: string, maxLines = 50): { content: string; lineS
     if (chunk.trim().length > 20) {
       chunks.push({ content: chunk, lineStart: i + 1, lineEnd: end });
     }
-    i = end;
+    if (end >= lines.length) break;
+    // Step forward by less than a full window so consecutive chunks share
+    // `overlapLines` lines of context — prevents an answer that straddles a
+    // chunk boundary from being split with neither half retrievable well.
+    // Guard: only overlap if it actually advances past the current start,
+    // otherwise fall back to a full step (keeps the loop terminating).
+    const next = end - overlapLines;
+    i = next > i ? next : end;
   }
   return chunks;
 }

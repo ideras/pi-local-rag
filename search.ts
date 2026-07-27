@@ -35,6 +35,11 @@ function l2ToCosine(l2Dist: number): number {
   return 1 - (l2Dist * l2Dist) / 2;
 }
 
+function buildFtsQuery(query: string, op: "AND" | "OR"): string {
+  const terms = query.split(/\s+/).filter(Boolean).map(t => `"${t.replace(/"/g, '""')}"`);
+  return terms.join(` ${op} `);
+}
+
 /**
  * Hybrid search using SQLite FTS5 (BM25) + sqlite-vec (vector).
  */
@@ -50,9 +55,17 @@ export async function hybridSearch(
   if (!repo.hasAnyChunks(database)) return [];
 
   // BM25 via FTS5 — cap candidates to avoid scanning entire index
-  const ftsQuery = query.split(/\s+/).map(t => `"${t.replace(/"/g, '""')}"`).join(" ");
   const ftsLimit = Math.max(limit * 20, 200);
-  const ftsResults = repo.searchFts(database, ftsQuery, ftsLimit);
+  let ftsResults = repo.searchFts(database, buildFtsQuery(query, "AND"), ftsLimit);
+  if (ftsResults.length === 0) {
+    // Requiring every term to appear zeroes out BM25 recall on any chunk that
+    // paraphrases even one word. Retry with OR so lexical search can still
+    // contribute a signal — vector search alone shouldn't have to carry it.
+    const termCount = query.split(/\s+/).filter(Boolean).length;
+    if (termCount > 1) {
+      ftsResults = repo.searchFts(database, buildFtsQuery(query, "OR"), ftsLimit);
+    }
+  }
 
   // Vector via sqlite-vec
   const queryVec = await embed(query);
@@ -86,8 +99,13 @@ export async function hybridSearch(
         bm25NormMap.set(r.rowid, 1);
       }
     } else {
+      // FTS5's bm25() returns *negative* scores where the BEST match is the
+      // most negative (repo.searchFts relies on `ORDER BY bm25(...) ASC`).
+      // Min-max must therefore peak at the most-negative score, not at the
+      // max — otherwise the worst lexical match normalizes to 1.0 and the
+      // best to 0.0, inverting the BM25 ranking (verified against FTS5).
       for (const r of ftsResults) {
-        bm25NormMap.set(r.rowid, (r.bm25_score - bm25Min) / bm25Range);
+        bm25NormMap.set(r.rowid, (bm25Max - r.bm25_score) / bm25Range);
       }
     }
   }
@@ -118,9 +136,36 @@ export async function hybridSearch(
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
   const scored: ScoredChunk[] = [];
 
+  // A retrieval path contributes to the hybrid score only when its weight is
+  // non-zero. When vectors are absent the blend below collapses to pure BM25
+  // (alpha is ignored), so BM25 always contributes; otherwise BM25 contributes
+  // when alpha > 0 and vectors contribute when alpha < 1.
+  //
+  // We gate retention on *which path retrieved a chunk* rather than on the
+  // normalized hybrid value. The previous `hybrid > 0` exit filter had two
+  // failure modes that both produced hybrid === 0 but had opposite intent:
+  //
+  //   - the weakest *genuine* BM25 hit in a min-max set zeros out and gets
+  //     dropped (min-max normalization floors the weakest at exactly 0),
+  //     so e.g. the weaker of two lexical matches simply vanished; and
+  //   - a vector-only neighbor under a pure-BM25 (alpha = 1) query also zeros
+  //     out — correctly suppressed noise.
+  //
+  // Retrieval presence lets us tell them apart: keep a chunk iff it was
+  // retrieved by a path that contributes to the blend under this alpha.
+  const bm25Contributes = !hasVectors || alpha > 0;
+  const vecContributes = hasVectors && alpha < 1;
+
   for (const rowid of allRowIds) {
     const c = chunkMap.get(rowid);
     if (!c) continue;
+
+    // Drop chunks retrieved only by a path that doesn't blend under alpha
+    // (e.g. vector-only neighbors of a pure-BM25 query) — those are noise.
+    const relevant =
+      (bm25Contributes && ftsRowIds.has(rowid)) ||
+      (vecContributes && vecRowIds.has(rowid));
+    if (!relevant) continue;
 
     const bm25Norm = bm25NormMap.get(rowid) ?? 0;
     const vecNorm = vecNormMap.get(rowid) ?? 0;
@@ -148,7 +193,6 @@ export async function hybridSearch(
   }
 
   return scored
-    .filter(s => s.hybrid > 0)
     .sort((a, b) => b.hybrid - a.hybrid)
     .slice(0, limit);
 }
