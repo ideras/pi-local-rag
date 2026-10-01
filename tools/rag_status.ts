@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { loadConfig } from "../config.ts";
 import { getIndexStats } from "../db.ts";
 import { getRagDir, GLOBAL_RAG_DIR } from "../store.ts";

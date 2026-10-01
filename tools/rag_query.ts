@@ -1,4 +1,4 @@
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import { loadConfig } from "../config.ts";
 import { getIndexStats } from "../db.ts";
 import { hybridSearch } from "../search.ts";

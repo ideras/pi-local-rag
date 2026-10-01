@@ -1,4 +1,4 @@
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { getRagDir } from "../store.ts";
