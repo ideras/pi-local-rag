@@ -38,7 +38,7 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { existsSync } from "node:fs";
 import { resolve, extname, basename, relative } from "node:path";
 import ignore from "ignore";
